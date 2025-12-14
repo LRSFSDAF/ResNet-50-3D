@@ -1,32 +1,36 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import models, transforms
 from torchvision.models import ResNet50_Weights
 from PIL import Image
 import os
 import json
 import matplotlib.pyplot as plt
+import time
+import numpy as np
 
 # ==========================================
-# 1. 配置路径
+# 0. 全局配置与路径
 # ==========================================
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_ROOT = os.path.join(CURRENT_DIR, "data", "FreiHAND_pub_v2")
 
-# 手部骨架连接定义 (FreiHAND/MANO 标准)
-# 拇指: 0-1-2-3-4, 食指: 0-5-6-7-8, ...
+BATCH_SIZE = 64
+EPOCHS = 15       # 测试用，测试通过后改为 10
+LEARNING_RATE = 1e-4
+
 SKELETON = [
-    [0, 1], [1, 2], [2, 3], [3, 4],       # Thumb
-    [0, 5], [5, 6], [6, 7], [7, 8],       # Index
-    [0, 9], [9, 10], [10, 11], [11, 12],  # Middle
-    [0, 13], [13, 14], [14, 15], [15, 16],# Ring
-    [0, 17], [17, 18], [18, 19], [19, 20] # Pinky
+    [0, 1], [1, 2], [2, 3], [3, 4],       # 拇指
+    [0, 5], [5, 6], [6, 7], [7, 8],       # 食指
+    [0, 9], [9, 10], [10, 11], [11, 12],  # 中指
+    [0, 13], [13, 14], [14, 15], [15, 16],# 无名指
+    [0, 17], [17, 18], [18, 19], [19, 20] # 小指
 ]
 
 # ==========================================
-# 2. 定义网络架构
+# 1. 网络架构
 # ==========================================
 class HandObjectPoseNet(nn.Module):
     def __init__(self, weights=ResNet50_Weights.IMAGENET1K_V1):
@@ -34,7 +38,6 @@ class HandObjectPoseNet(nn.Module):
         resnet = models.resnet50(weights=weights)
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
         
-        # 输出 21 * 3 = 63 维坐标
         self.hand_head = nn.Sequential(
             nn.Linear(2048, 1024),
             nn.ReLU(),
@@ -50,7 +53,7 @@ class HandObjectPoseNet(nn.Module):
         return hand_pose
 
 # ==========================================
-# 3. 数据集加载器 (升级版：读取K矩阵)
+# 2. 数据集加载器
 # ==========================================
 class FreiHANDDataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -64,37 +67,41 @@ class FreiHANDDataset(Dataset):
         if not os.path.exists(self.xyz_path):
             raise FileNotFoundError(f"找不到标注文件: {self.xyz_path}")
             
-        print("正在加载标注数据...")
+        print("正在加载标注数据 (JSON)...")
         with open(self.xyz_path, 'r') as f:
             self.all_joints = json.load(f)
             
         with open(self.k_path, 'r') as f:
             self.all_ks = json.load(f)
-
-        # 为了快速演示，只取前 500 个样本
-        # 正式训练请注释掉下面这行
-        self.all_joints = self.all_joints[:500]
-        self.all_ks = self.all_ks[:500]
+            
+        # === 测试模式：仅取前 500 个标注 ===
+        # TEST_NUM = 500
+        # print(f"!!! [测试模式] 仅截取前 {TEST_NUM} 个标注进行试验 !!!")
+        # self.all_joints = self.all_joints[:TEST_NUM]
+        # self.all_ks = self.all_ks[:TEST_NUM]
+        # ================================
         
-        print(f"加载成功，样本数: {len(self.all_joints)}")
+        self.num_samples = len(self.all_joints) * 4 
+        print(f"扩增后图片总数: {self.num_samples}")
 
     def __len__(self):
-        return len(self.all_joints)
+        return self.num_samples
 
     def __getitem__(self, idx):
         img_name = f"{idx:08d}.jpg"
         img_path = os.path.join(self.img_dir, img_name)
         
-        image = Image.open(img_path).convert('RGB')
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception:
+            image = Image.new('RGB', (224, 224))
         
-        # 读取数据
-        joints = torch.tensor(self.all_joints[idx], dtype=torch.float32)
-        K = torch.tensor(self.all_ks[idx], dtype=torch.float32)
+        ann_idx = idx % len(self.all_joints)
         
-        # 记录原始根节点坐标 (用于后续可视化恢复绝对深度)
+        joints = torch.tensor(self.all_joints[ann_idx], dtype=torch.float32)
+        K = torch.tensor(self.all_ks[ann_idx], dtype=torch.float32)
+        
         root_joint = joints[9].clone() 
-        
-        # 归一化：相对坐标 (减去中指根部)
         joints = joints - root_joint
 
         if self.transform:
@@ -103,78 +110,77 @@ class FreiHANDDataset(Dataset):
         return image, joints, K, root_joint
 
 # ==========================================
-# 4. 工具函数：可视化与绘图
+# 3. 辅助函数
 # ==========================================
-def project_points_3d_to_2d(xyz, K):
-    """
-    将3D点投影到2D图像平面
-    xyz: [N, 3]
-    K:   [3, 3]
-    return: [N, 2]
-    """
-    # 矩阵乘法: (K * xyz^T)^T
+def calculate_metrics(pred, gt, threshold=0.05):
+    error = torch.norm(pred - gt, dim=2)
+    mpjpe = error.mean().item()
+    correct_joints = (error < threshold).sum().item()
+    accuracy = correct_joints / error.numel()
+    return mpjpe, accuracy
+
+def project_points(xyz, K):
     uv = torch.matmul(K, xyz.t()).t()
-    # 透视除法: x' = x/z, y' = y/z
     return uv[:, :2] / uv[:, 2:3]
 
-def visualize_results(image_tensor, pred_3d, gt_3d, K, root_joint, epoch, index):
-    """
-    绘制对比图并保存
-    """
-    # 反归一化图像 (Tensor -> Numpy RGB)
+def visualize_sample(image, pred, gt, K, root, epoch, sample_idx):
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    img = image_tensor.cpu() * std + mean
-    img = img.clamp(0, 1).permute(1, 2, 0).numpy()
+    # image一般不需要grad，所以这里直接 cpu().numpy() 没问题
+    img = (image.cpu() * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
     
-    # 恢复绝对坐标用于投影 (Pred_Rel + GT_Root)
-    # 注意：实际预测中应该预测绝对深度，这里简化处理，假设深度已知
-    pred_abs = pred_3d.cpu() + root_joint.cpu()
-    gt_abs = gt_3d.cpu() + root_joint.cpu()
+    # 【修复关键点】：pred 是模型输出，带有梯度，必须先 .detach() 再转 numpy
+    pred_abs = pred.cpu().detach() + root.cpu() 
+    gt_abs = gt.cpu() + root.cpu()
     K = K.cpu()
     
-    # 投影到 2D
-    pred_2d = project_points_3d_to_2d(pred_abs, K).numpy()
-    gt_2d = project_points_3d_to_2d(gt_abs, K).numpy()
+    # 投影后也要确保没有梯度
+    p2d = project_points(pred_abs, K).numpy()
+    g2d = project_points(gt_abs, K).numpy()
     
-    # 绘图
-    plt.figure(figsize=(8, 8))
+    plt.figure(figsize=(6, 6))
     plt.imshow(img)
-    
-    # 画骨架连线
     for link in SKELETON:
-        # Ground Truth (绿色)
-        plt.plot(gt_2d[link, 0], gt_2d[link, 1], color='lime', linewidth=2, alpha=0.7, label='GT' if link==SKELETON[0] else "")
-        # Prediction (红色)
-        plt.plot(pred_2d[link, 0], pred_2d[link, 1], color='red', linewidth=2, alpha=0.7, label='Pred' if link==SKELETON[0] else "")
-        
-    plt.legend()
-    plt.title(f"Epoch {epoch} - Sample {index}")
-    plt.axis('off')
+        plt.plot(g2d[link, 0], g2d[link, 1], 'lime', alpha=0.7, lw=2)
+        plt.plot(p2d[link, 0], p2d[link, 1], 'red', alpha=0.7, lw=2)
     
-    # 保存图片
-    if not os.path.exists('./results'):
-        os.makedirs('./results')
-    plt.savefig(f'./results/epoch_{epoch}_sample_{index}.png')
+    plt.axis('off')
+    plt.title(f"Test Sample - Epoch {epoch}")
+    plt.savefig(f'./results/epoch_{epoch}_test_{sample_idx}.png')
     plt.close()
 
-def plot_loss_curve(loss_history):
-    plt.figure(figsize=(10, 5))
-    plt.plot(loss_history, label='Training Loss')
-    plt.title('Training Loss Curve')
+def plot_curves(train_losses, val_losses, val_accs):
+    epochs = range(1, len(train_losses) + 1)
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, 'b-', label='Train Loss')
+    plt.plot(epochs, val_losses, 'r-', label='Val Loss')
+    plt.title('Loss Curve')
     plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss')
+    plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
-    plt.savefig('./results/loss_curve.png')
-    print("Loss曲线已保存至 ./results/loss_curve.png")
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, val_accs, 'g-', label='Val Accuracy')
+    plt.title('Validation Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Acc')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.savefig('./results/training_metrics.png')
+    print("训练指标曲线已保存至 ./results/training_metrics.png")
 
 # ==========================================
-# 5. 训练主程序
+# 4. 主训练程序
 # ==========================================
-def train_model():
+def main():
+    if not os.path.exists('./results'):
+        os.makedirs('./results')
+        
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
+    print(f"硬件设备: {device}")
     
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -183,78 +189,124 @@ def train_model():
     ])
     
     try:
-        dataset = FreiHANDDataset(DATASET_ROOT, transform=transform)
+        full_dataset = FreiHANDDataset(DATASET_ROOT, transform=transform)
     except Exception as e:
-        print(f"错误: {e}")
+        print(f"数据加载错误: {e}")
         return
 
-    # 划分数据集
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+    total_size = len(full_dataset)
+    train_size = int(0.6 * total_size)
+    val_size = int(0.2 * total_size)
+    test_size = total_size - train_size - val_size
     
-    # num_workers=0 避免Windows报错
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=0)
-    # 测试集batch_size设为1，方便可视化
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+    print(f"数据划分: 训练集={train_size}, 验证集={val_size}, 测试集={test_size}")
     
-    model = HandObjectPoseNet(weights=ResNet50_Weights.IMAGENET1K_V1).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    train_set, val_set, test_set = random_split(full_dataset, [train_size, val_size, test_size])
+    
+    # train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    train_loader = DataLoader(
+        train_set, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=8,      # 尝试设为 8，利用多核 CPU
+        pin_memory=True,    # 开启内存锁页加速
+        persistent_workers=True # 保持子进程存活，减少每个Epoch的启动开销
+    )
+
+    # val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    val_loader = DataLoader(
+        val_set, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=4,      # 验证集不需要太高
+        pin_memory=True,
+        persistent_workers=True
+    )
+    
+    test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
+    
+    model = HandObjectPoseNet().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
     
-    epochs = 10  # 增加一点轮数看曲线
-    loss_history = []
+    history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
     
-    print("\n=== 开始训练 ===")
-    for epoch in range(epochs):
+    print("\n=== 开始计时 ===")
+    start_time = time.time()
+    
+    for epoch in range(EPOCHS):
+        # --- Training ---
         model.train()
-        epoch_loss = 0.0
+        train_loss_sum = 0.0
         
-        for i, (imgs, gt_hand, _, _) in enumerate(train_loader):
-            imgs = imgs.to(device)
-            gt_hand = gt_hand.to(device)
-            
+        for i, (imgs, gt, _, _) in enumerate(train_loader):
+            imgs, gt = imgs.to(device), gt.to(device)
             optimizer.zero_grad()
-            pred_hand = model(imgs)
-            loss = criterion(pred_hand, gt_hand)
+            pred = model(imgs)
+            loss = criterion(pred, gt)
             loss.backward()
             optimizer.step()
+            train_loss_sum += loss.item()
             
-            epoch_loss += loss.item()
+            if i % 100 == 0:
+                print(f"[Epoch {epoch+1}][Train] Step {i}/{len(train_loader)} Loss: {loss.item():.6f}")
         
-        avg_loss = epoch_loss / len(train_loader)
-        loss_history.append(avg_loss)
-        print(f"Epoch {epoch+1}/{epochs}, Step {i}, Loss: {loss.item():.6f}")
+        avg_train_loss = train_loss_sum / len(train_loader)
+        history['train_loss'].append(avg_train_loss)
         
-        # --- 每个Epoch结束后，在测试集上随机抽取一张进行可视化 ---
+        # --- Validation ---
         model.eval()
+        val_loss_sum = 0.0
+        val_mpjpe_sum = 0.0
+        val_acc_sum = 0.0
+        
         with torch.no_grad():
-            # 取测试集第一个样本
-            sample_img, sample_gt, sample_K, sample_root = next(iter(test_loader))
-            sample_img = sample_img.to(device)
-            pred_hand = model(sample_img) # [1, 21, 3]
-            
-            # 调用可视化函数 (只画第一张图)
-            visualize_results(
-                sample_img[0], 
-                pred_hand[0], 
-                sample_gt[0], 
-                sample_K[0], 
-                sample_root[0], 
-                epoch + 1, 
-                0
-            )
-            model.train() # 切回训练模式
+            for imgs, gt, _, _ in val_loader:
+                imgs, gt = imgs.to(device), gt.to(device)
+                pred = model(imgs)
+                
+                loss = criterion(pred, gt)
+                val_loss_sum += loss.item()
+                
+                mpjpe, acc = calculate_metrics(pred, gt, threshold=0.05)
+                val_mpjpe_sum += mpjpe
+                val_acc_sum += acc
+                
+        avg_val_loss = val_loss_sum / len(val_loader)
+        avg_val_mpjpe = val_mpjpe_sum / len(val_loader)
+        avg_val_acc = val_acc_sum / len(val_loader)
+        
+        history['val_loss'].append(avg_val_loss)
+        history['val_acc'].append(avg_val_acc)
+        
+        print(f"\n>>> Epoch {epoch+1} 完成")
+        print(f"    Train Loss: {avg_train_loss:.6f}")
+        print(f"    Val Loss  : {avg_val_loss:.6f}")
+        print(f"    Val MPJPE : {avg_val_mpjpe:.6f}")
+        print(f"    Val Acc   : {avg_val_acc*100:.2f}%")
+        
+        # --- 可视化 ---
+        # 修正：在 infer 阶段也可以加上 no_grad，或者在内部 detach
+        sample = next(iter(test_loader))
+        s_img, s_gt, s_K, s_root = sample
+        s_img = s_img.to(device)
+        s_pred = model(s_img) # 这里出来的 pred 带有梯度
+        
+        # 调用 visualize_sample 时内部已经加了 .detach()
+        visualize_sample(s_img[0], s_pred[0], s_gt[0], s_K[0], s_root[0], epoch+1, 0)
 
-    # 训练结束，绘制Loss曲线
-    plot_loss_curve(loss_history)
+    end_time = time.time()
+    total_time = end_time - start_time
     
-    # 保存模型
-    torch.save(model.state_dict(), "resnet_freihand_final.pth")
-    print("训练完成。结果图片保存在 ./results 文件夹中。")
+    print("="*40)
+    print(f"全部训练完成！")
+    print(f"总耗时: {total_time/60:.2f} 分钟")
+    print("="*40)
+    
+    plot_curves(history['train_loss'], history['val_loss'], history['val_acc'])
+    # torch.save(model.state_dict(), "resnet_freihand_test.pth")
+    torch.save(model.state_dict(), "resnet_freihand_full.pth")
+    print("模型已保存。")
 
 if __name__ == "__main__":
-    # 创建结果保存目录
-    if not os.path.exists('./results'):
-        os.makedirs('./results')
-    train_model()
+    main()
